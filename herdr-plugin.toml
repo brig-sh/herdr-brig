@@ -1,0 +1,41 @@
+id = "brig-sh.herdr-brig"
+name = "herdr-brig"
+version = "0.0.1"
+min_herdr_version = "0.9.0"
+platforms = ["macos", "linux"]
+description = "Brig microVM sandboxes as herdr machines: one key creates a sandbox for a project and starts Claude Code in it, another removes it."
+
+# Actions run on the host as you, with your herdr access. They take input
+# only from the popup you type into, never from a guest, and pass it to
+# brig and herdr as argv, never as shell text.
+
+[[actions]]
+id = "new"
+title = "Brig: new sandbox"
+contexts = ["workspace", "pane"]
+command = ["bin/herdr-brig", "new"]
+
+[[actions]]
+id = "remove"
+title = "Brig: remove sandbox"
+contexts = ["workspace", "pane"]
+command = ["bin/herdr-brig", "remove"]
+
+# The actions open these popups. A popup has a terminal, so it can ask
+# questions; an action does not.
+
+[[panes]]
+id = "new-form"
+title = "Brig: new sandbox"
+placement = "popup"
+width = "70%"
+height = "25%"
+command = ["bin/herdr-brig", "new-form"]
+
+[[panes]]
+id = "remove-form"
+title = "Brig: remove sandbox"
+placement = "popup"
+width = "70%"
+height = "25%"
+command = ["bin/herdr-brig", "remove-form"]

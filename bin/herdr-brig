@@ -1,0 +1,431 @@
+#!/usr/bin/env bash
+# herdr-brig: start a Brig sandbox and add it as a herdr machine, or remove one.
+#
+# The flow it automates is the one in brig's docs/herdr.md:
+#
+#   brig run -d <profile>@<name> <dir>
+#   herdr machine add <profile>+<name> --label <name>
+#
+# plus the steps that page leaves to you: opening a workspace in the project
+# instead of /root, starting the agent, and removing a sandbox in an order
+# that herdr cannot undo.
+#
+# Spike quality: bash, no dependencies beyond brig, herdr and ssh. It runs
+# under macOS's bash 3.2, so no readline defaults or associative arrays.
+set -euo pipefail
+
+# A herdr plugin process does not get your login shell's PATH.
+PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
+
+PLUGIN_ID="brig-sh.herdr-brig"
+
+# Brig profile names cannot contain '+', so <profile>+<name> splits at the
+# first '+'. The ssh block in docs/herdr.md matches herdr*+*, so only a
+# profile whose name starts with herdr is reachable.
+PROFILE_RE='^herdr[a-z0-9-]*$'
+NAME_RE='^[a-z0-9][a-z0-9-]{0,30}$'
+
+die() { printf '\nerror: %s\n' "$*" >&2; exit 1; }
+step() { printf '\n==> %s\n' "$*"; }
+
+# brig prints a warning for every unusable profile on stderr; keep stderr for
+# real failures by filtering that one block.
+brigq() { brig "$@" 2> >(grep -v -e 'ignoring .* unusable profile' -e '^brig:   /' >&2); }
+
+# --- actions (no terminal: open the popup and return) -----------------------
+
+# A string field of the context herdr hands an action.
+context_field() {
+	printf '%s' "${HERDR_PLUGIN_CONTEXT_JSON:-}" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" | head -1
+}
+
+# The focused pane's directory, only when that pane is on this machine. A pane
+# on a sandbox machine reports whatever directory its guest says it is in, and
+# that must not become the suggested host mount. The local server must know
+# the pane id and report the same directory for it.
+context_cwd() {
+	local cwd id local_cwd
+	cwd=$(context_field focused_pane_cwd)
+	id=$(context_field focused_pane_id)
+	[ -n "$cwd" ] && [ -n "$id" ] || return 0
+	# The pane's own cwd is the first "cwd" field; foreground_cwd comes later.
+	local_cwd=$(herdr pane get "$id" 2>/dev/null | grep -o '"cwd":"[^"]*"' | head -1 | cut -d'"' -f4)
+	[ "$local_cwd" = "$cwd" ] && printf '%s' "$cwd"
+	return 0
+}
+
+# Succeeds when <dir>, a physical path, may be mounted read-write into a
+# sandbox. A guest can write anything it is given, so refused are the places
+# where a written file becomes code or configuration the host runs:
+#   - the root, your home and any directory above it, which hold all of these;
+#   - every top-level dot directory in your home (.ssh, .config, .local,
+#     .claude, .kube, .docker, ...) and ~/Library, by pattern, not by name;
+#   - a directory on PATH, inside one, or holding one;
+#   - the system and code locations a PATH may lack: a plugin process gets a
+#     reduced PATH, and reading the login shell's would run its startup files.
+mountable() {
+	local d="$1" home p
+	home=$(cd "$HOME" && pwd -P)
+	[ "$d" != / ] || return 1
+	case "$home/" in "$d"/*) return 1 ;; esac
+	case "$d/" in "$home"/.*/* | "$home"/Library/*) return 1 ;; esac
+	for p in /usr /etc /opt /bin /sbin /System /Library /Applications /private/etc \
+		"$home/bin" "$home/go" "$home/Applications"; do
+		case "$d/" in "$p"/*) return 1 ;; esac
+		case "$p/" in "$d"/*) return 1 ;; esac
+	done
+	local IFS=:
+	for p in $PATH; do
+		case "$p" in /*) ;; *) continue ;; esac
+		# Compare the physical path when it can be resolved, the path as given
+		# when it cannot (a directory you may not enter is still refused).
+		p=$(cd "$p" 2>/dev/null && pwd -P || printf '%s' "$p")
+		case "$d/" in "$p"/*) return 1 ;; esac
+		case "$p/" in "$d"/*) return 1 ;; esac
+	done
+	return 0
+}
+
+open_form() {
+	local form="$1"
+	herdr plugin pane open --plugin "$PLUGIN_ID" --entrypoint "$form" \
+		--placement popup --env "HERDR_BRIG_CWD=$(context_cwd)"
+}
+
+# --- shared checks -----------------------------------------------------------
+
+check_tools() {
+	command -v brig >/dev/null || die "brig is not on PATH"
+	command -v herdr >/dev/null || die "herdr is not on PATH"
+}
+
+SSH_CONFIG="$HOME/.ssh/config"
+
+# The block from brig's docs/herdr.md, verbatim. Keep the two in step.
+ssh_block() {
+	cat <<'BLOCK'
+Host herdr*+*
+  User root
+  ForwardAgent no
+  StrictHostKeyChecking yes
+  UserKnownHostsFile /dev/null
+  KnownHostsCommand /bin/sh -c 'r=$(echo "$1" | sed "s/+/@/") && k=$(brig -q exec "$r" -- cat /etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null) && [ -n "$k" ] && echo "$1 $k"' sh %n
+  LogLevel ERROR
+  ProxyCommand sh -c 'exec brig -q exec "${1%%+*}@${1#*+}" -- /usr/local/sbin/herdr-sshd 2>/dev/null' sh %n
+BLOCK
+}
+
+# Succeeds when ssh resolves <profile>+<name> through brig exec and herdr-sshd.
+has_ssh_block() {
+	ssh -G "$1+probe" 2>/dev/null | grep -q '^proxycommand .*brig.*exec.*herdr-sshd'
+}
+
+# Prints <config> with the block inserted before its first Host or Match line,
+# or appended when it has none. Not at the top: an Include below the block
+# would then apply only to herdr hosts. Not at the end: ssh takes the first
+# value it finds, so a `Host *` above the block that sets User would win.
+# awk reads the block from a file: BSD awk refuses a -v value with a newline.
+splice_ssh_block() {
+	local config="$1" blockfile
+	blockfile=$(mktemp)
+	ssh_block >"$blockfile"
+	awk -v bf="$blockfile" '
+		function block(l) { while ((getline l < bf) > 0) print l; close(bf) }
+		!done && /^[[:space:]]*(Host|Match)[[:space:]]/ { block(); print ""; done = 1 }
+		{ print }
+		END { if (!done) { if (NR) print ""; block() } }
+	' "$config"
+	rm -f "$blockfile"
+}
+
+write_ssh_block() {
+	local profile="$1" backup tmp
+	mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+	[ -f "$SSH_CONFIG" ] || { : >"$SSH_CONFIG" && chmod 600 "$SSH_CONFIG"; }
+	backup="$SSH_CONFIG.bak-herdr-brig-$(date +%Y%m%d%H%M%S)"
+	cp -p "$SSH_CONFIG" "$backup"
+	tmp=$(mktemp "$SSH_CONFIG.XXXXXX")
+	splice_ssh_block "$backup" >"$tmp"
+	chmod 600 "$tmp" && mv "$tmp" "$SSH_CONFIG"
+
+	# Check what ssh now resolves, not what was written.
+	if ! has_ssh_block "$profile" ||
+		[ "$(ssh -G "$profile+probe" 2>/dev/null | sed -n 's/^user //p')" != root ]; then
+		cp -p "$backup" "$SSH_CONFIG"
+		die "ssh did not resolve $profile+<name> through the new block; restored $SSH_CONFIG from $backup"
+	fi
+	echo "Updated $SSH_CONFIG (backup: $backup)."
+}
+
+# herdr reaches a sandbox only through the ssh block. Without it,
+# `herdr machine add` fails with an ssh error that does not say why. Offer to
+# write it; never write it without a yes.
+check_ssh_block() {
+	local profile="$1" answer
+	has_ssh_block "$profile" && return 0
+
+	echo "herdr reaches a sandbox over ssh. $SSH_CONFIG needs this block:"
+	echo
+	ssh_block | sed 's/^/    /'
+	echo
+	printf 'Add it to %s? [Y/n] ' "$SSH_CONFIG"
+	read -r answer
+	case "$answer" in
+	n* | N*) die "the ssh block is required; nothing was created" ;;
+	*) write_ssh_block "$profile" ;;
+	esac
+}
+
+# Lines of "id<TAB>label<TAB>target" for herdr machines that are Brig sandboxes.
+brig_machines() {
+	herdr machine list 2>/dev/null | awk -F'\t' '$3 ~ /^herdr[a-z0-9-]*\+/ { print $1 "\t" $2 "\t" $3 }'
+}
+
+# Removes every policy bound to the one session <profile>@<name>, so a later
+# sandbox with the same name does not inherit it. Detaching one that is not
+# bound only prints a note.
+unbind_policies() {
+	local p
+	for p in $(policy_names); do
+		brigq policy detach "$p" "$1" -n "$2" >/dev/null 2>&1 || true
+	done
+}
+
+# Policy names, one per line. In `brig policy ls` a policy's line starts with
+# its name; "bound to:" lines are indented.
+policy_names() {
+	brigq policy ls | awk '/^[^ ]/ { print $1 }'
+}
+
+# Policies bound to every run of <profile>, one per line.
+profile_policies() {
+	brigq policy ls | awk -v prof="$1" '
+		/^[^ ]/ { cur = $1; next }
+		/^ +bound to: / {
+			sub(/^ +bound to: /, ""); n = split($0, b, /, /)
+			for (i = 1; i <= n; i++) if (b[i] == prof) print cur
+		}'
+}
+
+# Asks which policy to bind to this one sandbox, on top of what the profile
+# binds. Sets POLICY to a name, or "" for none. Policies are your own, so the
+# default is none unless $HERDR_BRIG_POLICY names one.
+choose_policy() {
+	local profile="$1" names bound def="${HERDR_BRIG_POLICY:-}" i=0 p answer
+	POLICY=""
+	names=$(policy_names)
+	[ -n "$names" ] || return 0
+	bound=$(profile_policies "$profile")
+	printf '%s\n' "$names" | grep -qx "$def" || def=""
+	printf '%s\n' "$bound" | grep -qx "$def" && def=""
+
+	echo
+	[ -z "$bound" ] || echo "Bound to every $profile sandbox: $(printf '%s' "$bound" | tr '\n' ' ')"
+	echo "Policy for this sandbox:"
+	local -a list
+	for p in $names; do
+		printf '%s\n' "$bound" | grep -qx "$p" && continue
+		i=$((i + 1)); list[i]=$p
+		printf '  %d) %s\n' "$i" "$p"
+	done
+	echo "  -) none"
+	while :; do
+		printf 'Choose 1-%d or - [%s]: ' "$i" "${def:--}"
+		read -r answer || die "no choice made"
+		answer=${answer:-${def:--}}
+		case "$answer" in
+		-) POLICY=""; return 0 ;;
+		*[!0-9]*) printf '%s\n' "${list[@]}" | grep -qx "$answer" && { POLICY=$answer; return 0; } ;;
+		*) [ "$answer" -ge 1 ] && [ "$answer" -le "$i" ] && { POLICY=${list[answer]}; return 0; } ;;
+		esac
+	done
+}
+
+# Workspace ids on a herdr machine, in order.
+remote_workspaces() {
+	herdr --machine "$1" workspace list | grep -o '"workspace_id":"[^"]*"' | cut -d'"' -f4 | awk '!seen[$0]++'
+}
+
+# The popup closes when the script exits. Keep it open only on a failure, so
+# the error stays readable; a success closes it at once.
+pause_on_error() {
+	local rc=$?
+	[ "$rc" -eq 0 ] && return 0
+	printf '\nPress Enter to close.'
+	read -r _ || true
+	return "$rc"
+}
+
+# --- new ---------------------------------------------------------------------
+
+new_form() {
+	trap pause_on_error EXIT
+	check_tools
+
+	local profiles profile
+	# A profile's first line starts with its name; detail lines are indented.
+	profiles=$(brigq agent ls | awk '/^[a-z]/ { print $1 }' | grep -E "$PROFILE_RE" || true)
+	[ -n "$profiles" ] || die "brig has no herdr profile (brig agent ls). Update brig to a version that ships it."
+	if [ "$(printf '%s\n' "$profiles" | wc -l)" -eq 1 ]; then
+		profile=$profiles
+	else
+		echo "Profile:"
+		select profile in $profiles; do [ -n "$profile" ] && break; done
+	fi
+	check_ssh_block "$profile"
+
+	# "-" mounts nothing: the sandbox sees no host directory but its guest home.
+	# The default is the focused pane's directory, and only when it is a host
+	# directory that may be mounted (see context_cwd and mountable).
+	local dir=- answer
+	if [ -n "${HERDR_BRIG_CWD:-}" ] && [ -d "$HERDR_BRIG_CWD" ] &&
+		mountable "$(cd "$HERDR_BRIG_CWD" && pwd -P)"; then
+		dir=$(cd "$HERDR_BRIG_CWD" && pwd -P)
+	fi
+	printf 'Project directory to mount, or - for none [%s]: ' "$dir"
+	read -r answer
+	[ -z "$answer" ] || dir="${answer/#\~/$HOME}"
+	if [ "$dir" = "-" ]; then
+		dir=""
+	else
+		[ -d "$dir" ] || die "$dir is not a directory"
+		dir=$(cd "$dir" && pwd -P)
+		mountable "$dir" || die "refusing to mount $dir: it is, holds or is inside a directory with your keys or configuration"
+	fi
+
+	# In a linked worktree or a submodule, .git is a file that points into
+	# another repository's .git, which the guest cannot see, so git does not
+	# work in the sandbox. Say so rather than refuse: the files are still useful.
+	if [ -n "$dir" ] && [ -f "$dir/.git" ]; then
+		echo "Note: $dir is a linked worktree or submodule. Its files are mounted, but git will not work in the sandbox."
+	fi
+
+	local name=scratch
+	[ -z "$dir" ] || name=$(basename "$dir" | tr 'A-Z' 'a-z' | sed -e 's/[^a-z0-9-]/-/g' -e 's/^-*//' | cut -c1-31)
+	printf 'Sandbox name [%s]: ' "$name"
+	read -r answer
+	[ -z "$answer" ] || name="$answer"
+	[[ "$name" =~ $NAME_RE ]] || die "a sandbox name is lowercase letters, digits and '-', at most 31 characters"
+
+	choose_policy "$profile"
+	local policy=$POLICY
+
+	local target="$profile+$name"
+	if brig_machines | awk -F'\t' -v t="$target" '$3 == t { found = 1 } END { exit !found }'; then
+		die "herdr already has a machine for $target. Remove it first with 'Brig: remove sandbox'."
+	fi
+
+	# The binding is per session: brig keys it on the sandbox name. Check
+	# before anything is created that the routes of every bound policy can
+	# apply together: two policies that each define a route with the same
+	# name, one bound to the profile and one chosen here, cannot.
+	if [ -n "$policy" ]; then
+		step "brig policy attach $policy $profile -n $name"
+		brigq policy attach "$policy" "$profile" -n "$name" >/dev/null || die "brig policy attach failed"
+		if ! brigq policy check "$profile" -n "$name" >/dev/null 2>&1; then
+			brigq policy detach "$policy" "$profile" -n "$name" >/dev/null 2>&1 || true
+			die "$policy cannot apply together with what $profile binds ($(profile_policies "$profile" | tr '\n' ' ')). See: brig policy check $profile -n $name"
+		fi
+	fi
+
+	if [ -n "$dir" ]; then
+		step "brig run -d $profile@$name $dir"
+		brigq run -d "$profile@$name" "$dir" || { unbind_policies "$profile" "$name"; die "brig run failed"; }
+	else
+		step "brig run -d --no-project $profile@$name"
+		brigq run -d --no-project "$profile@$name" || { unbind_policies "$profile" "$name"; die "brig run failed"; }
+	fi
+
+	step "herdr machine add $target --label $name"
+	if ! herdr machine add "$target" --label "$name" </dev/null; then
+		# Leave nothing half-made: a sandbox without a machine is invisible here.
+		brigq rm "$profile@$name" || true
+		unbind_policies "$profile" "$name"
+		die "herdr machine add failed; removed the sandbox again"
+	fi
+
+	# herdr opens a new remote with one workspace in the guest home, /root.
+	# brig mounts a project at /work/<basename>, so with a project, open a
+	# workspace there and close the default one: one machine, one workspace.
+	local work=/root pane ws
+	if [ -n "$dir" ]; then
+		work="/work/$(basename "$dir")"
+		step "workspace in $work"
+		local created
+		created=$(herdr --machine "$name" workspace create --cwd "$work" --label "$name" --focus)
+		ws=$(printf '%s' "$created" | sed -n 's/.*"workspace":{[^}]*"workspace_id":"\([^"]*\)".*/\1/p')
+		pane=$(printf '%s' "$created" | sed -n 's/.*"root_pane":{[^}]*"pane_id":"\([^"]*\)".*/\1/p')
+		[ -n "$ws" ] && [ -n "$pane" ] || die "could not open a workspace on $name"
+		local other
+		for other in $(remote_workspaces "$name"); do
+			[ "$other" = "$ws" ] || herdr --machine "$name" workspace close "$other" >/dev/null || true
+		done
+	else
+		ws=$(remote_workspaces "$name" | head -1)
+		[ -n "$ws" ] || die "herdr opened no workspace on $name"
+		herdr --machine "$name" workspace rename "$ws" "$name" >/dev/null || true
+		pane=$(herdr --machine "$name" pane list --workspace "$ws" |
+			sed -n 's/.*"pane_id":"\([^"]*\)".*/\1/p' | head -1)
+		[ -n "$pane" ] || die "could not find a pane on $name"
+	fi
+
+	printf '\nStart Claude Code in it now? [Y/n] '
+	read -r answer
+	case "$answer" in
+	n* | N*) ;;
+	*)
+		step "claude in $name:$pane"
+		herdr --machine "$name" agent start "$name" --kind claude --pane "$pane" --timeout 90000 >/dev/null ||
+			echo "claude did not report ready; open the workspace and check the pane"
+		;;
+	esac
+
+	printf '\nDone. Machine "%s" is in the sidebar; its workspace is %s; policy: %s.\n' "$name" "$work" "${policy:-only what the profile binds}"
+}
+
+# --- remove ------------------------------------------------------------------
+
+remove_form() {
+	trap pause_on_error EXIT
+	check_tools
+
+	local machines
+	machines=$(brig_machines)
+	[ -n "$machines" ] || die "no herdr machine is a Brig sandbox"
+
+	local labels choice
+	labels=$(printf '%s\n' "$machines" | cut -f2)
+	echo "Sandbox to remove (this deletes its guest home; the project stays):"
+	select choice in $labels; do [ -n "$choice" ] && break; done
+
+	local id target profile name
+	id=$(printf '%s\n' "$machines" | awk -F'\t' -v l="$choice" '$2 == l { print $1; exit }')
+	target=$(printf '%s\n' "$machines" | awk -F'\t' -v l="$choice" '$2 == l { print $3; exit }')
+	profile="${target%%+*}"
+	name="${target#*+}"
+
+	printf 'Remove %s@%s? [y/N] ' "$profile" "$name"
+	read -r answer
+	case "$answer" in y* | Y*) ;; *) echo "Nothing removed."; return 0 ;; esac
+
+	# Order matters. An enabled machine reconnects, and the reconnect's
+	# `brig exec` boots the sandbox again within seconds of `brig rm`.
+	# Disabling it first stops that without restarting the herdr client.
+	step "herdr machine disable $id"
+	herdr machine disable "$id"
+	step "brig rm $profile@$name"
+	brigq rm "$profile@$name" || die "brig rm failed; the machine stays disabled, not removed"
+	step "herdr machine remove $id"
+	herdr machine remove "$id"
+	unbind_policies "$profile" "$name"
+
+	printf '\nDone. Removed %s@%s.\n' "$profile" "$name"
+}
+
+case "${1:-}" in
+new) open_form new-form ;;
+remove) open_form remove-form ;;
+new-form) new_form ;;
+remove-form) remove_form ;;
+*) die "usage: herdr-brig new|remove|new-form|remove-form" ;;
+esac
