@@ -191,6 +191,25 @@ unbind_policies() {
 	done
 }
 
+# Succeeds while any `brig exec <ref>` runs, as started by the ssh block's
+# ProxyCommand or KnownHostsCommand. Waits up to 30 s for none to remain.
+wait_for_execs() {
+	local i=0
+	# Anchored: only a process that is brig itself, not a shell whose command
+	# line mentions it.
+	while pgrep -f "^([^ ]*/)?brig( -q)? exec $1( |\$)" >/dev/null; do
+		i=$((i + 1))
+		[ "$i" -le 60 ] || return 1
+		sleep 0.5
+	done
+	return 0
+}
+
+# Succeeds when brig lists <ref> as a sandbox, in any state.
+sandbox_exists() {
+	brigq ls | awk -v r="$1" 'NR > 1 && $1 == r { found = 1 } END { exit !found }'
+}
+
 # Policy names, one per line. In `brig policy ls` a policy's line starts with
 # its name; "bound to:" lines are indented.
 policy_names() {
@@ -413,8 +432,28 @@ remove_form() {
 	# Disabling it first stops that without restarting the herdr client.
 	step "herdr machine disable $id"
 	herdr machine disable "$id"
-	step "brig rm $profile@$name"
-	brigq rm "$profile@$name" || die "brig rm failed; the machine stays disabled, not removed"
+	# A brig exec that herdr started before the disable (a reconnect, or the
+	# ssh block's known-hosts check) boots the sandbox again if it reaches
+	# brig after brig rm. Wait for those to end, remove the sandbox, and
+	# remove it again if one still brought it back.
+	# brig rm can also fail while such an exec is booting the sandbox, so a
+	# failure is retried rather than final.
+	# The sandbox has been seen back more than 3 s after brig rm, so watch
+	# brig ls for 15 s after each removal.
+	local ref="$profile@$name" try i back
+	for try in 1 2 3 4 5; do
+		wait_for_execs "$ref" || echo "a brig exec for $ref is still running after 30 s"
+		step "brig rm $ref"
+		brigq rm "$ref" || true
+		back=0
+		for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+			sleep 1
+			if sandbox_exists "$ref"; then back=1; break; fi
+		done
+		[ "$back" = 1 ] || break
+		echo "$ref is listed again; removing it again"
+	done
+	[ "$back" = 0 ] || die "$ref came back after 5 removals; the machine stays disabled. Run brig rm $ref"
 	step "herdr machine remove $id"
 	herdr machine remove "$id"
 	unbind_policies "$profile" "$name"

@@ -311,9 +311,11 @@ Set these in the environment herdr runs plugins with.
   token. A pane keeps the token it started with. After a broker restart, a
   running agent gets `401 … the session token was refused`; start it again
   in a new pane.
-- **Remove race.** A reconnect that started before the disable can boot the
-  sandbox after `brig rm`. `brig ls` shows it as `starting`. Run
-  `brig rm herdr@<name>` again.
+- **Remove race.** A `brig exec` that herdr started before the disable can
+  boot the sandbox again after `brig rm`. Remove waits for such execs, then
+  watches `brig ls` for 15 s after each `brig rm` and removes the sandbox
+  again if it is back, up to 5 times. What boots it a second time is not
+  known.
 
 ## Development
 
