@@ -97,6 +97,11 @@ herdr reaches a sandbox over ssh, and the block runs `brig exec` as the
 keeps a backup as `~/.ssh/config.bak-herdr-brig-<timestamp>`, and restores the
 backup if ssh does not resolve `herdr+<name>` through it.
 
+A block written before the host name was quoted (its `ProxyCommand` ends in
+`sh %n`) still works for ordinary names, but an unquoted name is glob expanded
+by the host shell. The plugin offers to replace its two lines in place, with the
+same backup and check, and otherwise points you to Brig's docs.
+
 The plugin stops with a message when `brig` or `herdr` is missing, when Brig
 has no `herdr` profile, when you decline the ssh block, when a machine with
 the same name exists, or when the chosen policy cannot apply together with the

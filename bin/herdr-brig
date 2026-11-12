@@ -109,8 +109,19 @@ Host herdr*+*
   ForwardAgent no
   StrictHostKeyChecking yes
   UserKnownHostsFile /dev/null
-  KnownHostsCommand /bin/sh -c 'r=$(echo "$1" | sed "s/+/@/") && k=$(brig -q exec "$r" -- cat /etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null) && [ -n "$k" ] && echo "$1 $k"' sh %n
+  KnownHostsCommand /bin/sh -c 'r=$(echo "$1" | sed "s/+/@/") && k=$(brig -q exec "$r" -- cat /etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null) && [ -n "$k" ] && echo "$1 $k"' sh '%n'
   LogLevel ERROR
+  ProxyCommand /bin/sh -c 'exec brig -q exec "${1%%%%+*}@${1#*+}" -- /usr/local/sbin/herdr-sshd 2>/dev/null' sh '%n'
+BLOCK
+}
+
+# The two lines of the block as written before %n was quoted. ssh substituted
+# the host name into a shell command unquoted, so the host shell glob expanded
+# it, and wrote %% where ssh needs %%%%. replace_old_ssh_lines swaps these for
+# the current ones.
+old_ssh_lines() {
+	cat <<'BLOCK'
+  KnownHostsCommand /bin/sh -c 'r=$(echo "$1" | sed "s/+/@/") && k=$(brig -q exec "$r" -- cat /etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null) && [ -n "$k" ] && echo "$1 $k"' sh %n
   ProxyCommand sh -c 'exec brig -q exec "${1%%+*}@${1#*+}" -- /usr/local/sbin/herdr-sshd 2>/dev/null' sh %n
 BLOCK
 }
@@ -118,6 +129,12 @@ BLOCK
 # Succeeds when ssh resolves <profile>+<name> through brig exec and herdr-sshd.
 has_ssh_block() {
 	ssh -G "$1+probe" 2>/dev/null | grep -q '^proxycommand .*brig.*exec.*herdr-sshd'
+}
+
+# Succeeds when that block is the current one, which passes the host name
+# quoted. ssh -G prints the ProxyCommand as written, tokens unexpanded.
+has_current_ssh_block() {
+	ssh -G "$1+probe" 2>/dev/null | grep -q "^proxycommand .*herdr-sshd.* sh '%n'\$"
 }
 
 # Prints <config> with the block inserted before its first Host or Match line,
@@ -157,12 +174,69 @@ write_ssh_block() {
 	echo "Updated $SSH_CONFIG (backup: $backup)."
 }
 
+# Prints <config> with each line of old_ssh_lines replaced by its current form,
+# keeping the line's own indentation. Lines are compared without leading
+# whitespace and must match exactly, so a block someone edited is left alone.
+replace_old_ssh_lines() {
+	local config="$1" oldfile newfile
+	oldfile=$(mktemp) newfile=$(mktemp)
+	old_ssh_lines | sed 's/^[[:space:]]*//' >"$oldfile"
+	ssh_block | grep -E '^[[:space:]]*(KnownHostsCommand|ProxyCommand) ' | sed 's/^[[:space:]]*//' >"$newfile"
+	awk -v of="$oldfile" -v nf="$newfile" '
+		BEGIN { n = 0; while ((getline l < of) > 0) old[++n] = l
+		        m = 0; while ((getline l < nf) > 0) new[++m] = l }
+		{ t = $0; sub(/^[[:space:]]+/, "", t); ind = substr($0, 1, length($0) - length(t))
+		  for (i = 1; i <= n; i++) if (t == old[i]) { print ind new[i]; next }
+		  print }
+	' "$config"
+	rm -f "$oldfile" "$newfile"
+}
+
+# Replaces the old block's two lines in $SSH_CONFIG, keeping a backup, and
+# restores the backup unless ssh then resolves the current block. Fails, with
+# $SSH_CONFIG untouched, when the old lines are not in it verbatim (an Include,
+# or a block edited by hand).
+upgrade_ssh_block() {
+	local profile="$1" backup tmp
+	backup="$SSH_CONFIG.bak-herdr-brig-$(date +%Y%m%d%H%M%S)"
+	cp -p "$SSH_CONFIG" "$backup"
+	tmp=$(mktemp "$SSH_CONFIG.XXXXXX")
+	replace_old_ssh_lines "$backup" >"$tmp"
+	if cmp -s "$backup" "$tmp"; then
+		rm -f "$tmp" "$backup"
+		return 1
+	fi
+	chmod 600 "$tmp" && mv "$tmp" "$SSH_CONFIG"
+	if ! has_current_ssh_block "$profile"; then
+		cp -p "$backup" "$SSH_CONFIG"
+		echo "ssh did not resolve the updated block; restored $SSH_CONFIG from $backup."
+		return 1
+	fi
+	echo "Updated $SSH_CONFIG (backup: $backup)."
+}
+
 # herdr reaches a sandbox only through the ssh block. Without it,
 # `herdr machine add` fails with an ssh error that does not say why. Offer to
 # write it; never write it without a yes.
 check_ssh_block() {
 	local profile="$1" answer
-	has_ssh_block "$profile" && return 0
+	if has_ssh_block "$profile"; then
+		has_current_ssh_block "$profile" && return 0
+		# The old block still works for ordinary names, so this never stops
+		# a sandbox from being created.
+		echo "$SSH_CONFIG has the herdr ssh block from before its host name was"
+		echo "quoted. An unquoted name is glob expanded by your shell, so a name"
+		echo "with * in it can reach a different sandbox."
+		printf 'Update the block in %s? [Y/n] ' "$SSH_CONFIG"
+		read -r answer
+		case "$answer" in
+		n* | N*) echo "Left $SSH_CONFIG as it is." ;;
+		*) upgrade_ssh_block "$profile" ||
+			echo "Could not update it in place. Replace the block by hand with the one in brig's docs/herdr.md." ;;
+		esac
+		echo
+		return 0
+	fi
 
 	echo "herdr reaches a sandbox over ssh. $SSH_CONFIG needs this block:"
 	echo
